@@ -1,9 +1,7 @@
-import math
-
 import cv2
 import numpy as np
 
-eps = np.finfo(np.float32).eps
+import util
 
 
 def grayscale(img):
@@ -52,61 +50,18 @@ def region_of_interest(img, vertices):
     return masked_image
 
 
-def get_slope(x1, x2, y1, y2):
-    return (y2 - y1) / (x2 - x1 + eps)
+def merge_lines(lines, h, state=None):
+    if len(lines):
+        line_pts = np.array(util.line2pts(lines))
+        line_param = cv2.fitLine(line_pts, cv2.DIST_L2, 0, 0.01, 0.01)
+    else:
+        line_param = None
 
-
-def line2pts(lines):
-    pts = []
-    for x1, y1, x2, y2 in lines:
-        pts.append((x1, y1))
-        pts.append((x2, y2))
-
-    return pts
-
-
-def extrapolate_line(line_param, top_y, bottom_y):
-    vx, vy, x, y = line_param
-    m = vy / vx
-    b = int(y - x * m)
-
-    print('y = %sx + %s' % (m, b))
-    top_x = int((top_y - b) / m)
-    bottom_x = int((bottom_y - b) / m)
-
-    return (top_x, int(top_y), bottom_x, int(bottom_y))
-
-
-def merge_lines(lines, h):
-    line_pts = np.array(line2pts(lines))
-    line_param = cv2.fitLine(line_pts, cv2.DIST_L2, 0, 0.01, 0.01)
-
-    return extrapolate_line(line_param, h * 0.6, h)
-
-
-def reject_outliers2(data, m=2):
-    selector = np.array(abs(data - np.mean(data)) <= m * np.std(data))
-
-    if len(selector.shape) == 0:
-        selector = selector.reshape((1, ))
-
-    return selector
-
-
-def reject_outliers(data, m=2.):
-    d = np.abs(data - np.median(data))
-    mdev = np.median(d)
-    s = d / mdev if mdev else 0.
-    selector = np.array(s <= m)
-
-    if len(selector.shape) == 0:
-        selector = selector.reshape((1, ))
-
-    return selector
+    return util.extrapolate_line(line_param, h * 0.6, h, state=state)
 
 
 def line2segs(lines):
-    slopes = [get_slope(*line) for line in lines]
+    slopes = [util.get_slope(*line) for line in lines]
 
     left_slopes = []
     right_slopes = []
@@ -114,73 +69,49 @@ def line2segs(lines):
     right_idx = []
     for idx, slope in enumerate(slopes):
         # skip near horizontal lines and overly steep lines
+        if abs(slope) < 0.3 or abs(slope) > 2:
+            continue
+
         if slope > 0:
-            if abs(slope) < 1 or abs(slope) > 2:
-                continue
             right_idx.append(idx)
             right_slopes.append(slope)
         else:
-            if abs(slope) < 1 or abs(slope) > 2:
-                continue
-            # print('Slope::', slope)
             left_idx.append(idx)
             left_slopes.append(slope)
 
-    # print('LEFT #',
-    # len(left_slopes), left_slopes, [
-    # left_slopes[idx]
-    # for idx, valid in enumerate(reject_outliers(left_slopes))
-    # if valid
-    # ])
-    # print('right #',
-    # len(right_slopes), right_slopes, [
-    # right_slopes[idx]
-    # for idx, valid in enumerate(reject_outliers(right_slopes))
-    # if valid
-    # ])
     left_slopes = np.array(left_slopes)
     right_slopes = np.array(right_slopes)
 
     left_lines = [
         lines[left_idx[idx]]
-        for idx, valid in enumerate(reject_outliers(left_slopes)) if valid
+        for idx, valid in enumerate(util.reject_outliers(left_slopes)) if valid
     ]
     right_lines = [
         lines[right_idx[idx]]
-        for idx, valid in enumerate(reject_outliers(right_slopes)) if valid
+        for idx, valid in enumerate(util.reject_outliers(right_slopes))
+        if valid
     ]
 
     return left_lines, right_lines
 
 
-def draw_lines2(img, lines, color=[255, 0, 0], thickness=20):
-    """
-    NOTE: this is the function you might want to use as a starting point once you want to
-    average/extrapolate the line segments you detect to map out the full
-    extent of the lane (going from the result shown in raw-lines-example.mp4
-    to that shown in P1_example.mp4).
-
-    Think about things like separating line segments by their
-    slope ((y2-y1)/(x2-x1)) to decide which segments are part of the left
-    line vs. the right line.  Then, you can average the position of each of
-    the lines and extrapolate to the top and bottom of the lane.
-
-    This function draws `lines` with `color` and `thickness`.
-    Lines are drawn on the image inplace (mutates the image).
-    If you want to make the lines semi-transparent, think about combining
-    this function with the weighted_img() function below
-    """
+def draw_lines2(img, lines, color=[255, 0, 0], thickness=20, state=None):
     h, w, chan = img.shape
 
     lines = [line[0] for line in lines]
     left_lines, right_lines = line2segs(lines)
 
-    print('left line')
-    left_line = merge_lines(left_lines, h)
-    print('right line')
-    right_line = merge_lines(right_lines, h)
+    # print('left line')
+    left_line, left_state = merge_lines(left_lines, h, state and
+                                        (state.get('left') or {}))
 
-    # print(left_line, right_line)
+    # print('right line')
+    right_line, right_state = merge_lines(right_lines, h, state and
+                                          (state.get('right') or {}))
+
+    if state:
+        state['left'] = left_state
+        state['right'] = right_state
 
     for line in [left_line, right_line]:
         x1, y1, x2, y2 = line
@@ -193,7 +124,7 @@ def draw_lines(img, lines, color=[255, 0, 0], thickness=20):
             cv2.line(img, (x1, y1), (x2, y2), color, thickness)
 
 
-def hough_lines(img, rho, theta, threshold, min_line_len, max_line_gap):
+def hough_lines(img, rho, theta, threshold, min_line_len, max_line_gap, state):
     """
     `img` should be the output of a Canny transform.
 
@@ -207,8 +138,9 @@ def hough_lines(img, rho, theta, threshold, min_line_len, max_line_gap):
         np.array([]),
         minLineLength=min_line_len,
         maxLineGap=max_line_gap)
+
     line_img = np.zeros((img.shape[0], img.shape[1], 3), dtype=np.uint8)
-    draw_lines2(line_img, lines)
+    draw_lines2(line_img, lines, state=state)
 
     return line_img
 
